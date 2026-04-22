@@ -134,11 +134,11 @@ def centered(c, text, cx, y, font=FONT, fs=8):
 
 # ─── 1ページ描画 ─────────────────────────────────────────
 
-def draw_page(c, records, sankaken_label):
+def draw_page(c, records):
     """
     1ページ分を描画する。
-    records      : list of (name, tsushi_no) — 最大 ITEMS_PER_PAGE 件
-    sankaken_label: 摘要欄に使うラベル（例: '参加権A'）
+    records: list of (name, note_text) — 最大 ITEMS_PER_PAGE 件
+    note_text は build_note() で組み立て済みの摘要文字列。
     """
 
     # Y座標の基準点を上から順に計算（reportlabは左下原点・上方向が正）
@@ -250,14 +250,13 @@ def draw_page(c, records, sankaken_label):
 
         # データがある行のみ氏名・摘要を記入
         if i < len(records):
-            name, tsushi_no = records[i]
+            name, note_text = records[i]
 
             if name:
                 c.setFont(FONT, data_fs)
                 c.drawRightString(x_sama - 1 * mm, row_mid, name)
 
-            if tsushi_no:
-                note_text = f'{sankaken_label}：{tsushi_no}'
+            if note_text:
                 c.setFont(FONT, note_fs)
                 c.drawString(
                     x_note + 1.5 * mm,
@@ -272,26 +271,57 @@ def extract_sankaken(filename):
     """
     ファイル名から「参加権XX」を抽出して返す。
     例) '参加権A_リベ大.csv' → '参加権A'
-    見つからない場合は拡張子なしのファイル名をそのまま返す。
+    見つからない場合は None を返す（摘要欄の先頭ラベルを省略するため）。
     """
     base = os.path.splitext(os.path.basename(filename))[0]
     m = re.search(r'参加権[^\s_　/\\]+', base)
-    return m.group(0) if m else base
+    return m.group(0) if m else None
+
+
+def clean_name(name):
+    """
+    名前末尾の「様」と前後スペースを取り除く。
+    CSV の名前列に「山田 太郎 様」と入っている場合に使用。
+    テンプレート側で「様」を自動印字するため重複を防ぐ。
+    """
+    return re.sub(r'\s*様\s*$', '', str(name)).strip()
+
+
+def build_note(sankaken_label, tsushi_val, uketsuke_val):
+    """
+    摘要欄の文字列を組み立てる。
+
+    組み立てルール:
+      - ファイル名に「参加権XX」がある場合 → 先頭に追加
+      - 通し番号（CSV列 or 行連番）→ 必ず含める
+      - 受付番号（CSV列がある場合のみ）→ 末尾に追加
+
+    例）
+      参加権A CSV（受付番号なし）: '参加権A：0001'
+      このCSV（参加権なし、受付番号あり）: '8：000-009'
+      両方ある場合: '参加権A：15：122267-2108'
+    """
+    parts = []
+    if sankaken_label:
+        parts.append(sankaken_label)
+    parts.append(tsushi_val)
+    if uketsuke_val:
+        parts.append(uketsuke_val)
+    return '：'.join(parts)
 
 
 # ─── PDF生成 ─────────────────────────────────────────────
 
-def generate_pdf(records, output_path, sankaken_label):
+def generate_pdf(records, output_path):
     """
     records をページ分割してPDFに書き出す。
-    records      : list of (name, tsushi_no)
-    output_path  : 出力先PDFパス
-    sankaken_label: 摘要欄ラベル
+    records    : list of (name, note_text)
+    output_path: 出力先PDFパス
     """
     c = canvas.Canvas(output_path, pagesize=A4)
     pages = [records[i:i + ITEMS_PER_PAGE] for i in range(0, len(records), ITEMS_PER_PAGE)]
     for page_records in pages:
-        draw_page(c, page_records, sankaken_label)
+        draw_page(c, page_records)
         c.showPage()
     c.save()
     print(f'  -> {output_path}  ({len(records)}件, {len(pages)}ページ)')
@@ -312,26 +342,44 @@ def process_csv(csv_path):
     except UnicodeDecodeError:
         df = pd.read_csv(csv_path, encoding='shift_jis')
 
-    # 「氏名」を含むカラムを自動検索
-    name_col = next((c for c in df.columns if '氏名' in c or 'name' in c.lower()), None)
+    # ── カラム検索 ────────────────────────────────────────
+    # 名前: '名前' → '氏名' → 'name' の優先順で検索
+    name_col = next((c for c in df.columns if '名前' in c or '氏名' in c or 'name' in c.lower()), None)
     if name_col is None:
-        print(f'  [エラー] 氏名カラムが見つかりません。カラム一覧: {list(df.columns)}')
+        print(f'  [エラー] 名前カラムが見つかりません。カラム一覧: {list(df.columns)}')
         return
 
-    print(f'  使用カラム: 氏名={name_col!r}')
+    # 通し番号列（あれば使う、なければ行の連番で代用）
+    tsushi_col = next((c for c in df.columns if c == '通し番号' or ('通し' in c and '番号' in c)), None)
 
-    # (氏名, 通し番号) のリストを作成
-    # 通し番号: CSV内の行順（1始まり、4桁ゼロ埋め）
-    records = [
-        (
-            str(row[name_col]).strip() if pd.notna(row[name_col]) else '',
-            str(i + 1).zfill(4),
-        )
-        for i, (_, row) in enumerate(df.iterrows())
-    ]
+    # 受付番号列（あれば摘要末尾に追加）
+    uketsuke_col = next((c for c in df.columns if c == '受付番号' or ('受付' in c and '番号' in c)), None)
 
+    print(f'  使用カラム: 名前={name_col!r}, 通し番号={tsushi_col!r}, 受付番号={uketsuke_col!r}')
+
+    # ── レコード組み立て ──────────────────────────────────
     sankaken_label = extract_sankaken(csv_path)
     print(f'  参加権ラベル: {sankaken_label!r}')
+
+    records = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        # 氏名（末尾の「様」を除去）
+        name = clean_name(row[name_col]) if pd.notna(row[name_col]) else ''
+
+        # 通し番号: CSV列があればそれを使用、なければ行連番（4桁ゼロ埋め）
+        if tsushi_col and pd.notna(row[tsushi_col]):
+            tsushi_val = str(row[tsushi_col]).strip()
+        else:
+            tsushi_val = str(i + 1).zfill(4)
+
+        # 受付番号: CSV列があれば取得
+        if uketsuke_col and pd.notna(row[uketsuke_col]):
+            uketsuke_val = str(row[uketsuke_col]).strip()
+        else:
+            uketsuke_val = None
+
+        note = build_note(sankaken_label, tsushi_val, uketsuke_val)
+        records.append((name, note))
 
     base    = os.path.splitext(os.path.basename(csv_path))[0]
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
@@ -343,7 +391,7 @@ def process_csv(csv_path):
             out_path = os.path.join(out_dir, f'{base}_slip.pdf')
         else:
             out_path = os.path.join(out_dir, f'{base}_slip_{idx + 1:03d}.pdf')
-        generate_pdf(chunk, out_path, sankaken_label)
+        generate_pdf(chunk, out_path)
 
 
 # ─── エントリーポイント ───────────────────────────────────
